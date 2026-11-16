@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "db:push": "node -e \"require('fs').mkdirSync('data',{recursive:true})\" && drizzle-kit push",
+    "db:push": "node scripts/prepare-db.mjs && drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "setup": "npm install && npm run db:push",
     "postinstall": "npm run db:push || exit 0"

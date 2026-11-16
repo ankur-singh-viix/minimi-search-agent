@@ -3,24 +3,26 @@ import {
   APICallError,
   createUIMessageStreamResponse,
   generateId,
+  isStepCount,
   streamText,
   toUIMessageStream,
   type TextStreamPart,
   type ToolSet,
 } from "ai";
-import { asc, eq } from "drizzle-orm";
+import { asc } from "drizzle-orm";
 import { db } from "@/db";
-import { conversations, messages } from "@/db/schema";
+import { messages } from "@/db/schema";
 import { buildSystemPrompt } from "@/lib/prompt";
+import { webSearch } from "@/lib/webSearch";
 import { isStrictIso, nowIso } from "@/lib/time";
 import type { ChatUIMessage } from "@/lib/types";
 
 export const maxDuration = 60;
 
-const MAX_TITLE_LENGTH = 60;
 const PRIMARY_MODEL = "gemini-3.5-flash-lite";
 const FALLBACK_MODEL = "gemini-3.1-flash-lite";
 const FIRST_TOKEN_TIMEOUT_MS = 15_000;
+const MAX_STEPS = 3;
 const CAPACITY_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 
 type StreamPart = TextStreamPart<ToolSet>;
@@ -51,51 +53,20 @@ export async function POST(req: Request) {
     return badRequest("Invalid JSON body");
   }
 
-  const { message, conversationId } = (body ?? {}) as {
-    message?: unknown;
-    conversationId?: unknown;
-  };
+  const { message } = (body ?? {}) as { message?: unknown };
 
   if (typeof message !== "string" || message.trim() === "") {
     return badRequest("`message` must be a non-empty string");
   }
-  if (conversationId !== undefined && conversationId !== null && typeof conversationId !== "string") {
-    return badRequest("`conversationId` must be a string");
-  }
 
   const userText = message.trim();
-  let activeConversationId: string;
 
-  if (typeof conversationId === "string" && conversationId !== "") {
-    const existing = db
-      .select({ id: conversations.id })
-      .from(conversations)
-      .where(eq(conversations.id, conversationId))
-      .get();
-    if (!existing) return badRequest("Conversation not found", 404);
-    activeConversationId = existing.id;
-  } else {
-    const createdAt = nowIso();
-    const [created] = db
-      .insert(conversations)
-      .values({
-        title: userText.slice(0, MAX_TITLE_LENGTH),
-        createdAt,
-        updatedAt: createdAt,
-      })
-      .returning({ id: conversations.id })
-      .all();
-    activeConversationId = created.id;
-  }
-
-  const userCreatedAt = nowIso();
   const [userRow] = db
     .insert(messages)
     .values({
-      conversationId: activeConversationId,
       role: "user",
       content: userText,
-      createdAt: userCreatedAt,
+      createdAt: nowIso(),
     })
     .returning()
     .all();
@@ -103,7 +74,6 @@ export async function POST(req: Request) {
   const history = db
     .select()
     .from(messages)
-    .where(eq(messages.conversationId, activeConversationId))
     .orderBy(asc(messages.createdAt), asc(messages.id))
     .all()
     .filter((m) => m.id !== userRow.id);
@@ -116,15 +86,10 @@ export async function POST(req: Request) {
     if (!isStrictIso(assistantCreatedAt)) return;
     db.insert(messages)
       .values({
-        conversationId: activeConversationId,
         role: "assistant",
         content: text,
         createdAt: assistantCreatedAt,
       })
-      .run();
-    db.update(conversations)
-      .set({ updatedAt: nowIso() })
-      .where(eq(conversations.id, activeConversationId))
       .run();
   };
 
@@ -140,6 +105,8 @@ export async function POST(req: Request) {
       model: google(modelId),
       maxRetries: 0,
       abortSignal: controller.signal,
+      tools: { webSearch },
+      stopWhen: isStepCount(MAX_STEPS),
       providerOptions: {
         google: {
           thinkingConfig: { thinkingLevel: "low" },
@@ -147,7 +114,13 @@ export async function POST(req: Request) {
       },
       instructions: systemPrompt,
       messages: [{ role: "user", content: userText }],
-      onEnd: ({ text }) => saveAssistantMessage(text),
+      onEnd: ({ steps }) =>
+        saveAssistantMessage(
+          steps
+            .map((step) => step.text.trim())
+            .filter(Boolean)
+            .join("\n\n"),
+        ),
     });
 
     const iterator = result.stream[Symbol.asyncIterator]();
@@ -164,7 +137,13 @@ export async function POST(req: Request) {
           break;
         }
         if (value.type === "abort") break;
-        if (value.type === "text-delta") break;
+        if (
+          value.type === "text-delta" ||
+          value.type === "tool-input-start" ||
+          value.type === "tool-call"
+        ) {
+          break;
+        }
       }
     } catch (error) {
       failure = error;
@@ -205,10 +184,7 @@ export async function POST(req: Request) {
       generateMessageId: generateId,
       messageMetadata: ({ part }) => {
         if (part.type === "start") {
-          return {
-            conversationId: activeConversationId,
-            createdAt: assistantCreatedAt,
-          };
+          return { createdAt: assistantCreatedAt };
         }
       },
       onError: () => "Something went wrong while generating a response.",
