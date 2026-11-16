@@ -1,34 +1,30 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-
-type Role = "user" | "assistant";
-
-type ChatMessage = {
-  id: string;
-  role: Role;
-  content: string;
-  createdAt: string;
-};
-
-const INITIAL_MESSAGES: ChatMessage[] = [
-  {
-    id: "seed-1",
-    role: "assistant",
-    content: "Hello. Ask me anything and I'll do my best to help.",
-    createdAt: "2026-01-01T09:00:00.000Z",
-  },
-];
+import { useChat } from "@ai-sdk/react";
+import { DefaultChatTransport } from "ai";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ChatUIMessage } from "@/lib/types";
 
 function formatTime(iso: string) {
-  return new Date(iso).toLocaleTimeString([], {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], {
     hour: "numeric",
     minute: "2-digit",
   });
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function messageText(message: ChatUIMessage) {
+  return message.parts
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("");
+}
+
+function MessageBubble({ message }: { message: ChatUIMessage }) {
   const isUser = message.role === "user";
+  const createdAt = message.metadata?.createdAt;
+  const text = messageText(message);
+  if (!text) return null;
   return (
     <li className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}>
       <div
@@ -38,41 +34,68 @@ function MessageBubble({ message }: { message: ChatMessage }) {
             : "bg-black/[0.06] text-neutral-900 dark:bg-white/10 dark:text-neutral-100"
         }`}
       >
-        {message.content}
+        {text}
       </div>
-      <time
-        dateTime={message.createdAt}
-        suppressHydrationWarning
-        className="mt-1 px-2 text-[11px] text-neutral-400"
-      >
-        {formatTime(message.createdAt)}
-      </time>
+      {createdAt && (
+        <time
+          dateTime={createdAt}
+          title={createdAt}
+          suppressHydrationWarning
+          className="mt-1 px-2 text-[11px] text-neutral-400"
+        >
+          {formatTime(createdAt)}
+        </time>
+      )}
     </li>
   );
 }
 
 export default function Chat() {
-  const [messages, setMessages] = useState<ChatMessage[]>(INITIAL_MESSAGES);
   const [draft, setDraft] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
 
+  const [transport] = useState(
+    () =>
+      new DefaultChatTransport<ChatUIMessage>({
+        api: "/api/chat",
+        prepareSendMessagesRequest: ({ messages, body }) => {
+          const last = messages[messages.length - 1];
+          return {
+            body: {
+              ...body,
+              message: last ? messageText(last) : "",
+            },
+          };
+        },
+      }),
+  );
+
+  const { messages, sendMessage, status, error } = useChat<ChatUIMessage>({
+    transport,
+  });
+
+  const conversationId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const id = messages[i].metadata?.conversationId;
+      if (id) return id;
+    }
+    return undefined;
+  }, [messages]);
+
+  const busy = status === "submitted" || status === "streaming";
+
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages]);
+  }, [messages, status]);
 
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
-    const content = draft.trim();
-    if (!content) return;
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: crypto.randomUUID(),
-        role: "user",
-        content,
-        createdAt: new Date().toISOString(),
-      },
-    ]);
+    const text = draft.trim();
+    if (!text || busy) return;
+    sendMessage(
+      { text, metadata: { createdAt: new Date().toISOString() } },
+      { body: { conversationId } },
+    );
     setDraft("");
   }
 
@@ -88,6 +111,14 @@ export default function Chat() {
             <MessageBubble key={m.id} message={m} />
           ))}
         </ul>
+        {status === "submitted" && (
+          <p className="mt-4 px-2 text-[13px] text-neutral-400">Thinking...</p>
+        )}
+        {error && (
+          <p role="alert" className="mt-4 px-2 text-[13px] text-red-500">
+            Something went wrong. Please try again.
+          </p>
+        )}
         <div ref={endRef} />
       </main>
 
@@ -104,7 +135,7 @@ export default function Chat() {
         />
         <button
           type="submit"
-          disabled={!draft.trim()}
+          disabled={busy || !draft.trim()}
           aria-label="Send"
           className="flex h-10 w-10 items-center justify-center rounded-full bg-[#0a84ff] text-white transition hover:bg-[#0071e3] disabled:opacity-30"
         >
